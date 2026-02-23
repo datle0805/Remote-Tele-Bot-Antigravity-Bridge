@@ -1,525 +1,349 @@
-/* ANTIGRAVITY TELEGRAM BRIDGE (V13.0 - PROACTIVE STATUS MSG) */
-// Copy this code and paste it into the antigravity IDE DevTools
+/* ANTIGRAVITY TELEGRAM BRIDGE (V13.6 - TAILWIND FIX) */
 (function () {
-  const CONFIG = {
-    token: "YOUR_TELEGRAM_BOT_TOKEN",
-    chatId: "YOUR_TELEGRAM_CHAT_ID",
-  };
-  let lastUpdateId = 0;
-  let isWaitingForAgent = false;
-  let lastHandledUpdateId = 0;
-  let pollIsRunning = false; // Guard to prevent multiple poll chains
-  let streamRound = 0; // Đếm số lần stream đã hoàn tất
-  let telegramUpdateQueue = Promise.resolve(); // Serialize Telegram updates
+    const CONFIG = {
+      token: "YOUR_TELEGRAM_BOT_TOKEN", 
+      chatId: "YOUR_TELEGRAM_CHAT_ID",
+    };
+    let lastUpdateId = 0, isWaitingForAgent = false, lastHandledUpdateId = 0;
+    let pollIsRunning = false, streamRound = 0;
+    let telegramUpdateQueue = Promise.resolve();
+    let isChatActive = true;
 
-  // Command & Control State
-  let isChatActive = true; // Default: Chat with Agent ON
-
-  // Commands List
-  const COMMANDS_HELP = `🤖 DANH SÁCH LỆNH:
+    const COMMANDS_HELP = `🤖 DANH SÁCH LỆNH:
 /chat on : Bật chat với Agent
 /chat off: Tắt chat với Agent
-/quota   : Xem hạn mức (Quota)
+/quota   : Xem hạn mức
+/debug   : Debug DOM
 /list    : Xem danh sách này`;
 
-  // State for streaming response
-  let streamState = {
-    messageIds: [],
-    lastFullText: "",
-    lastSendTime: 0,
-    pendingSend: false,
-  };
+    let streamState = { messageIds: [], lastFullText: "", lastSendTime: 0, pendingSend: false };
+    const THROTTLE_MS = 800;
 
-  const STREAM_CONFIG = {
-    IDLE_TIMEOUT: 3000, // 3s fallback nếu agent status không rõ
-    AGENT_DONE_TIMEOUT: 500, // 500ms khi agent RÕ RÀNG đã xong (Stop ẩn + Send sáng)
-    THROTTLE_MS: 800, // Gửi lên Telegram tối đa 0.8s/lần
-  };
-
-  function getAgentDoc() {
-    const iframe = document.getElementById("antigravity.agentPanel");
-    if (!iframe) return null;
-    try {
-      return iframe.contentDocument || iframe.contentWindow.document;
-    } catch (e) {
-      return null;
-    }
-  }
-
-  // Kiểm tra xem Agent có đang bận xử lý hay không
-  function isAgentBusy(doc) {
-    // 1. Kiểm tra nút Stop (nếu hiện -> đang chạy)
-    const stopVisible = isStopButtonVisible(doc);
-    if (stopVisible) return { busy: true, reason: "Stop button hiện" };
-
-    // 2. Kiểm tra nút Send (chỉ cần hiện diện, ko quan tâm sáng/tối)
-    const sendBtn =
-      doc.querySelector(
-        'button[data-tooltip-id="input-send-button-send-tooltip"]',
-      ) || doc.querySelector('button[aria-label="Send Message"]');
-    const sendVisible = sendBtn && sendBtn.offsetParent !== null;
-
-    if (sendVisible) return { busy: false, reason: "Send button đã hiện" };
-
-    // Nếu cả Stop và Send đều không rõ ràng, coi là đang bận (đang load)
-    return { busy: true, reason: "Đang chờ trạng thái ổn định" };
-  }
-
-  // Kiểm tra nút Stop có đang hiện không
-  function isStopButtonVisible(doc) {
-    const stopBtn = doc.querySelector(
-      'button[data-tooltip-id="input-send-button-stop-tooltip"]',
-    );
-    if (stopBtn && stopBtn.offsetParent !== null) return true;
-    const btns = doc.querySelectorAll("button");
-    for (const btn of btns) {
-      const label = (btn.getAttribute("aria-label") || "").toLowerCase();
-      const tooltip = (btn.getAttribute("data-tooltip-id") || "").toLowerCase();
-      if (
-        (label.includes("stop") || tooltip.includes("stop")) &&
-        btn.offsetParent !== null
-      ) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  // Lấy thông tin Quota từ Status Bar
-  function getQuotaInfo() {
-    // Tìm thông tin hạn mức từ thanh trạng thái (statusbar)
-    // Ưu tiên class 'statusbar-item-label' và các aria-label liên quan đến Quota
-    const items = document.querySelectorAll(
-      "a.statusbar-item-label, .status-bar-item",
-    );
-    let found = [];
-
-    for (const item of items) {
-      const label =
-        item.getAttribute("aria-label") || item.title || item.innerText || "";
-      const lowerLabel = label.toLowerCase();
-      if (
-        lowerLabel.includes("quota") ||
-        lowerLabel.includes("limit") ||
-        lowerLabel.includes("hạn mức")
-      ) {
-        found.push(label.trim());
-      }
-    }
-
-    // Nếu không tìm thấy, thử tìm trong agent panel iframe
-    if (found.length === 0) {
-      const agentDoc = getAgentDoc();
-      if (agentDoc) {
-        const agentItems = agentDoc.querySelectorAll(
-          'a.statusbar-item-label, [aria-label*="quota" i], [aria-label*="limit" i], [aria-label*="requests" i]',
-        );
-        for (const item of agentItems) {
-          const label =
-            item.getAttribute("aria-label") ||
-            item.title ||
-            item.innerText ||
-            "";
-          if (label) found.push(label.trim());
-        }
-      }
-    }
-
-    if (found.length > 0) {
-      // Loại bỏ trùng lặp và nối lại
-      const uniqueFound = [...new Set(found)].filter((item) =>
-        item.toLowerCase().includes("antigravity"),
-      );
-      return `📊 THÔNG TIN HẠN MỨC (QUOTA):\n\n${uniqueFound.join("\n---\n")}`;
-    }
-
-    return "❌ Không tìm thấy thông tin hạn mức (Quota). Hãy đảm bảo bạn đang mở IDE Antigravity.";
-  }
-
-  // ========== COMMAND HANDLING ==========
-  async function sendTelegramMessage(text) {
-    try {
-      await fetch(`https://api.telegram.org/bot${CONFIG.token}/sendMessage`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chat_id: CONFIG.chatId, text: text }),
-      });
-      console.log(`📤 Bot reply: ${text}`);
-    } catch (e) {
-      console.error("📡 Telegram error:", e.message);
-    }
-  }
-
-  function handleCommand(text) {
-    const cmd = text.trim().toLowerCase();
-
-    if (cmd === "/chat on") {
-      isChatActive = true;
-      sendTelegramMessage("✅ Đã BẬT tính năng chat với Agent.");
-    } else if (cmd === "/chat off") {
-      isChatActive = false;
-      sendTelegramMessage("⛔ Chức năng chat từ xa với Agent đã tạm dừng.");
-    } else if (cmd === "/quota") {
-      const quotaInfo = getQuotaInfo();
-      sendTelegramMessage(quotaInfo);
-    } else if (cmd === "/list") {
-      sendTelegramMessage(COMMANDS_HELP);
-    } else {
-      sendTelegramMessage("❓ Lệnh không hợp lệ. Gõ /list để xem hướng dẫn.");
-    }
-  }
-
-  // ========== POLLING (Recursive Long Poll - phản hồi tức thì) ==========
-  function startPolling() {
-    if (pollIsRunning) return;
-    pollIsRunning = true;
-    console.log("🔄 Polling started (recursive long poll, timeout=30s).");
-    poll();
-  }
-
-  async function poll() {
-    // Nếu đang chờ Agent trả lời, chờ 2s rồi thử lại
-    if (isWaitingForAgent) {
-      setTimeout(poll, 500);
-      return;
-    }
-
-    try {
-      const res = await fetch(
-        `https://api.telegram.org/bot${CONFIG.token}/getUpdates?offset=${lastUpdateId + 1}&timeout=30`,
-      );
-      const data = await res.json();
-      if (data.ok && data.result.length > 0) {
-        for (const update of data.result) {
-          lastUpdateId = update.update_id;
-          if (update.message && update.message.chat.id == CONFIG.chatId) {
-            // Chỉ dedupe theo update_id để không làm mất lệnh retry cùng text
-            if (update.update_id <= lastHandledUpdateId) continue;
-            const text = update.message.text;
-            if (!text) continue;
-            lastHandledUpdateId = update.update_id;
-
-            // 1. INTERCEPT COMMANDS
-            if (text.trim().startsWith("/")) {
-              console.log("🎮 Command received:", text);
-              handleCommand(text);
-              setTimeout(poll, 100);
-              return;
+    // ================================================================
+    // [SCOPE] - conversation DIV là root
+    // ================================================================
+    function getAgentScope() {
+        const el = document.getElementById('conversation')
+            || document.querySelector('[id*="conversation" i]');
+        if (el) {
+            if (el.tagName.toLowerCase() === 'iframe') {
+                const iDoc = el.contentDocument || el.contentWindow.document;
+                return { root: iDoc.body || iDoc.documentElement, doc: iDoc };
             }
-
-            // 2. CHECK CHAT ACTIVE
-            if (!isChatActive) {
-              console.log("🔒 Chat is OFF. Replying to user.");
-              sendTelegramMessage(
-                'Bot chat đang ở trạng thái dừng, hãy dùng lệnh "/chat on" để mở lại',
-              );
-              setTimeout(poll, 100);
-              return;
-            }
-
-            console.log("📥 Receiving task:", text);
-            handleTask(text);
-            // Sau khi xử lý, tiếp tục poll (isWaitingForAgent sẽ = true)
-            setTimeout(poll, 100);
-            return;
-          }
+            return { root: el, doc: document };
         }
-      }
-    } catch (e) {
-      console.error("📡 Poll error:", e.message);
-    }
-
-    // Gọi lại ngay (không delay) để tiếp tục long poll
-    setTimeout(poll, 100);
-  }
-
-  // ========== HANDLE TASK ==========
-  function handleTask(text) {
-    const doc = getAgentDoc();
-    if (!doc) {
-      console.log("❌ Không tìm thấy agent panel");
-      return;
-    }
-
-    const input = doc.querySelector(
-      '[contenteditable="true"][data-lexical-editor="true"]',
-    );
-    if (!input) {
-      console.log("❌ Không tìm thấy ô input");
-      return;
-    }
-
-    // Đánh dấu bận ngay lập tức
-    isWaitingForAgent = true;
-
-    // 1. Gửi ngay tin nhắn trạng thái "Đang xử lý"
-    streamState = {
-      messageIds: [],
-      lastFullText: "Agent đang xử lý...",
-      lastSendTime: Date.now(),
-      pendingSend: false,
-    };
-    updateTelegram(streamState.lastFullText);
-
-    // 2. Điền text và gửi
-    input.focus();
-    input.innerText = text;
-    input.dispatchEvent(new InputEvent("input", { bubbles: true, data: text }));
-
-    setTimeout(() => {
-      const sendBtn = doc.querySelector(
-        'button[data-tooltip-id="input-send-button-send-tooltip"]',
-      );
-      if (sendBtn && !sendBtn.disabled) {
-        sendBtn.click();
-        console.log("✅ Đã click gửi");
-      } else {
-        input.dispatchEvent(
-          new KeyboardEvent("keydown", {
-            key: "Enter",
-            code: "Enter",
-            keyCode: 13,
-            bubbles: true,
-          }),
-        );
-        console.log("✅ Đã nhấn Enter");
-      }
-
-      // Theo dõi response
-      const msgs = doc.querySelectorAll("div.prose.prose-sm");
-      const baselineCount = msgs.length;
-      const baselineText =
-        baselineCount > 0 ? msgs[baselineCount - 1].innerText : "";
-
-      // Ko reset messageIds để edit lại tin nhắn "Đang xử lý"
-      streamState.lastFullText = baselineText;
-      startContentObserver(doc, baselineText, baselineCount);
-    }, 300);
-  }
-
-  // ========== TELEGRAM MESSAGE HELPERS ==========
-  function splitMessage(text, chunkSize = 4000) {
-    if (!text) return [""];
-    const chunks = [];
-    for (let i = 0; i < text.length; i += chunkSize) {
-      chunks.push(text.substring(i, i + chunkSize));
-    }
-    return chunks.length > 0 ? chunks : [""];
-  }
-
-  function updateTelegram(fullText) {
-    if (!fullText) return Promise.resolve();
-    telegramUpdateQueue = telegramUpdateQueue
-      .then(() => updateTelegramNow(fullText))
-      .catch((e) =>
-        console.error("📡 Lỗi hàng đợi Telegram:", e?.message || e),
-      );
-    return telegramUpdateQueue;
-  }
-
-  async function updateTelegramNow(fullText) {
-    if (!fullText) return;
-    const chunks = splitMessage(fullText);
-
-    for (let i = 0; i < chunks.length; i++) {
-      const chunkText = chunks[i];
-      const messageId = streamState.messageIds[i];
-
-      try {
-        if (!messageId) {
-          const res = await fetch(
-            `https://api.telegram.org/bot${CONFIG.token}/sendMessage`,
-            {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ chat_id: CONFIG.chatId, text: chunkText }),
-            },
-          );
-          const data = await res.json();
-          if (data.ok) {
-            streamState.messageIds[i] = data.result.message_id;
-            console.log(`📤 Gửi tin mới phần ${i + 1}`);
-          }
-        } else {
-          await fetch(
-            `https://api.telegram.org/bot${CONFIG.token}/editMessageText`,
-            {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                chat_id: CONFIG.chatId,
-                message_id: messageId,
-                text: chunkText,
-              }),
-            },
-          );
+        for (const iframe of document.querySelectorAll('iframe')) {
+            try {
+                const iDoc = iframe.contentDocument || iframe.contentWindow.document;
+                if (iDoc?.querySelector('[contenteditable="true"]') || iDoc?.querySelector('textarea')) {
+                    return { root: iDoc.body, doc: iDoc };
+                }
+            } catch (e) { }
         }
-      } catch (e) {
-        console.error(`📡 Lỗi Telegram phần ${i + 1}:`, e.message);
-      }
-    }
-  }
-
-  // Global allow stopping the previous stream manually
-  let stopCurrentStream = null;
-
-  // ========== CONTENT OBSERVER (MutationObserver + Fallback + Throttle) ==========
-  function startContentObserver(doc, baselineText, baselineCount) {
-    // Stop previous stream if running
-    if (stopCurrentStream) {
-      console.log("🛑 Dừng stream cũ để bắt đầu stream mới.");
-      stopCurrentStream();
+        return { root: document.body, doc: document };
     }
 
-    streamRound++;
-    const round = streamRound;
-    console.log(
-      `👀 [Round ${round}] Bắt đầu theo dõi nội dung (baseline: ${baselineText.length} chars)...`,
-    );
+    // ================================================================
+    // ⭐ [SEND BUTTON] - Tìm bằng text "Send" (Tailwind UI ko có aria-label)
+    // ================================================================
+    function findSendButton(root) {
+        for (const btn of root.querySelectorAll('button')) {
+            const txt = (btn.innerText || btn.textContent || '').trim().toLowerCase();
+            if (txt === 'send') return btn;
+        }
+        // Fallback aria-label/tooltip
+        return root.querySelector('button[aria-label*="Send" i], button[data-tooltip-id*="send" i], button[title*="Send" i]');
+    }
 
-    let lastChangeTime = Date.now();
-    let checkInterval = null;
-    let observer = null;
-    let foundNewMessage = false;
-    let finished = false;
+    // ================================================================
+    // ⭐ [STOP BUTTON] - Tailwind: không aria-label, dùng text/svg
+    // ================================================================
+    function isAgentBusy(root) {
+        for (const btn of root.querySelectorAll('button')) {
+            const txt = (btn.innerText || btn.textContent || '').trim().toLowerCase();
+            if (txt === 'stop' || txt.includes('stop')) return true;
+            const label = (btn.getAttribute('aria-label') || '').toLowerCase();
+            if (label.includes('stop') && btn.offsetParent !== null) return true;
+        }
+        return false;
+    }
 
-    // Hàm cleanup thực sự
-    const cleanup = () => {
-      if (finished) return;
-      finished = true;
-      clearInterval(checkInterval);
-      if (observer) {
+    // ================================================================
+    // ⭐ [MESSAGE CONTENT] - Lấy nội dung chat từ conversation DIV
+    // Ưu tiên: chat element có nhiều p nhất → fallback: tất cả p
+    // ================================================================
+    function getAgentMessageText(root) {
+        // Thử lấy vùng chat (phần tử trung gian chứa nhiều p nhất)
+        const chatEls = root.querySelectorAll('[class*="chat" i]');
+        let bestEl = null, maxP = 0;
+        for (const el of chatEls) {
+            const pCount = el.querySelectorAll('p').length;
+            if (pCount > maxP) { maxP = pCount; bestEl = el; }
+        }
+
+        if (bestEl && maxP > 0) {
+            // Lấy text của tất cả p bên trong vùng chat, ghép lại
+            const paragraphs = Array.from(bestEl.querySelectorAll('p'));
+            return paragraphs.map(p => (p.innerText || p.textContent || '').trim()).filter(Boolean).join('\n\n');
+        }
+
+        // Fallback: lấy toàn bộ p trong root
+        const allP = Array.from(root.querySelectorAll('p'));
+        return allP.map(p => (p.innerText || p.textContent || '').trim()).filter(Boolean).join('\n\n');
+    }
+
+    // ================================================================
+    // [QUOTA]
+    // ================================================================
+    function getQuotaInfo() {
+        const items = document.querySelectorAll('[aria-label*="quota" i], [aria-label*="limit" i], a.statusbar-item-label');
+        const found = [];
+        for (const item of items) {
+            const label = item.getAttribute('aria-label') || item.title || item.innerText || '';
+            if (label.toLowerCase().includes('quota') || label.toLowerCase().includes('limit')) found.push(label.trim());
+        }
+        return found.length > 0 ? `📊 QUOTA:\n${[...new Set(found)].join('\n---\n')}` : "❌ Không tìm thấy Quota.";
+    }
+
+    // ================================================================
+    // [DEBUG]
+    // ================================================================
+    function runDebug() {
+        const { root } = getAgentScope();
+        let report = `🔍 DEBUG V13.6:\nRoot: ${root.tagName}#${root.id || 'none'}\n\n`;
+
+        const input = root.querySelector('[contenteditable="true"]') || root.querySelector('textarea');
+        report += input ? `✅ Input: ${input.tagName}\n` : `❌ Không tìm thấy input\n`;
+
+        const sendBtn = findSendButton(root);
+        report += sendBtn ? `✅ Send button: OK\n` : `❌ Không tìm thấy Send button\n`;
+
+        const chatEls = root.querySelectorAll('[class*="chat" i]');
+        report += `\n[class*="chat"]: ${chatEls.length} phần tử\n`;
+        chatEls.forEach((el, i) => {
+            const pCount = el.querySelectorAll('p').length;
+            const cls = el.className?.toString()?.substring(0, 60);
+            report += `  [${i}] class="${cls}", p="${pCount}"\n`;
+        });
+
+        const msgText = getAgentMessageText(root);
+        report += `\n📝 TEXT HIỆN TẠI (200 ký tự đầu):\n"${msgText.substring(0, 200)}"\n`;
+
+        report += `\n🔢 p count: ${root.querySelectorAll('p').length}\n`;
+
+        for (let i = 0; i < report.length; i += 3000) sendTelegramMessage(report.substring(i, i + 3000));
+    }
+
+    // ================================================================
+    // [TELEGRAM]
+    // ================================================================
+    async function sendTelegramMessage(text) {
         try {
-          observer.disconnect();
-        } catch (e) {}
-      }
-      stopCurrentStream = null; // Reset global stopper
-    };
-
-    // Gán vào global để handleTask có thể gọi nếu cần (mặc dù ở đây là tự gọi)
-    // Thực tế handleTask nên gọi stopCurrentStream() _trước khi_ gọi startContentObserver
-    // Nhưng startContentObserver tự lo cũng được.
-    // Tuy nhiên logic đúng là handleTask gọi.
-    stopCurrentStream = cleanup;
-
-    const onContentChange = () => {
-      const msgs = doc.querySelectorAll("div.prose.prose-sm");
-      if (msgs.length === 0) return;
-
-      const currentCount = msgs.length;
-      const text = msgs[currentCount - 1].innerText;
-      if (!text) return;
-
-      // Phát hiện response mới:
-      // 1. Số lượng message tăng lên (đã sang câu trả lời mới)
-      // 2. HOẶC text của block cuối cùng thay đổi so với baseline
-      if (
-        !foundNewMessage &&
-        (currentCount > baselineCount ||
-          (text.trim().length > 0 && text !== baselineText))
-      ) {
-        console.log(`🎉 [Round ${round}] Phát hiện response mới!`);
-        foundNewMessage = true;
-      }
-
-      // Chỉ xử lý nếu đã tìm thấy tin mới VÀ nội dung thay đổi
-      if (!foundNewMessage || text === streamState.lastFullText) return;
-
-      lastChangeTime = Date.now();
-      streamState.lastFullText = text;
-      streamState.pendingSend = true;
-
-      const now = Date.now();
-      if (now - streamState.lastSendTime >= STREAM_CONFIG.THROTTLE_MS) {
-        streamState.lastSendTime = now;
-        streamState.pendingSend = false;
-        updateTelegram(text);
-      }
-    };
-
-    // 1. MutationObserver
-    try {
-      observer = new MutationObserver(() => onContentChange());
-      observer.observe(doc.body, {
-        childList: true,
-        subtree: true,
-        characterData: true,
-      });
-      console.log(`✅ [Round ${round}] Observer gắn thành công.`);
-    } catch (e) {
-      console.error("❌ Observer error:", e);
+            await fetch(`https://api.telegram.org/bot${CONFIG.token}/sendMessage`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ chat_id: CONFIG.chatId, text })
+            });
+        } catch (e) { console.error('Telegram error:', e.message); }
     }
 
-    // 2. Interval: Fallback + Throttle Flush (NO AUTO FINISH)
-    checkInterval = setInterval(async () => {
-      if (finished) return;
-      const now = Date.now();
+    function updateTelegram(fullText) {
+        if (!fullText) return;
+        telegramUpdateQueue = telegramUpdateQueue.then(() => _updateNow(fullText)).catch(() => { });
+    }
 
-      // Fallback polling
-      onContentChange();
-
-      // Throttle flush: gửi text đang chờ
-      if (
-        foundNewMessage &&
-        streamState.pendingSend &&
-        now - streamState.lastSendTime >= STREAM_CONFIG.THROTTLE_MS
-      ) {
-        streamState.lastSendTime = now;
-        streamState.pendingSend = false;
-        await updateTelegram(streamState.lastFullText);
-      }
-
-      // CHECK EXIT CONDITION: Nếu Agent đã xong việc -> mở khóa cho tin nhắn mới
-      const busyStat = isAgentBusy(doc);
-      if (!busyStat.busy && isWaitingForAgent) {
-        isWaitingForAgent = false;
-        console.log("🔓 Agent đã xong việc. Mở khóa polling.");
-      }
-
-      // AUTO-CLICK RUN BUTTONS
-      clickRunButtons(doc);
-
-      // === REMOVED AUTO FINISH LOGIC ===
-      // Chúng ta KHÔNG BAO GIỜ tự động finishStream dựa trên idle time hay status.
-      // Stream chỉ kết thúc khi hàm cleanup() được gọi (tức là khi có message mới từ handleTask).
-    }, 500);
-  }
-
-  // ========== AUTO-RUN HELPER ==========
-  function clickRunButtons(doc) {
-    // Scan TOÀN BỘ button trong document thay vì chỉ trong lastMsg
-    const buttons = doc.querySelectorAll("button");
-
-    for (const btn of buttons) {
-      // Bỏ qua nếu đã click
-      if (btn.hasAttribute("data-auto-clicked")) continue;
-
-      const text = (btn.innerText || "").trim().toLowerCase();
-      const label = (btn.getAttribute("aria-label") || "").toLowerCase();
-      const title = (btn.getAttribute("title") || "").toLowerCase();
-
-      // Mở rộng điều kiện nhận diện: CHỈ kích nếu BẮT ĐẦU bằng "run"
-      const isRun =
-        text.startsWith("Run") ||
-        label.startsWith("Run") ||
-        title.startsWith("Run");
-
-      if (isRun) {
-        console.log(
-          `🎯 Tìm thấy nút RUN tiềm năng: Text="${text}", Label="${label}", Title="${title}", Disabled=${btn.disabled}`,
-        );
-
-        if (!btn.disabled) {
-          console.log("▶️ Đang click nút RUN...");
-          btn.click();
-          btn.setAttribute("data-auto-clicked", "true");
-        } else {
-          console.log("⏳ Nút RUN đang bị disabled, chờ...");
+    async function _updateNow(fullText) {
+        const chunks = [];
+        for (let i = 0; i < fullText.length; i += 4000) chunks.push(fullText.substring(i, i + 4000));
+        for (let i = 0; i < chunks.length; i++) {
+            const msgId = streamState.messageIds[i];
+            try {
+                if (!msgId) {
+                    const res = await fetch(`https://api.telegram.org/bot${CONFIG.token}/sendMessage`, {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ chat_id: CONFIG.chatId, text: chunks[i] })
+                    });
+                    const d = await res.json();
+                    if (d.ok) streamState.messageIds[i] = d.result.message_id;
+                } else {
+                    await fetch(`https://api.telegram.org/bot${CONFIG.token}/editMessageText`, {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ chat_id: CONFIG.chatId, message_id: msgId, text: chunks[i] })
+                    });
+                }
+            } catch (e) { }
         }
-      }
     }
-  }
 
-  console.log("🚀 BRIDGE V13.0 (PROACTIVE STATUS MSG) IS READY.");
-  startPolling();
+    // ================================================================
+    // [COMMANDS]
+    // ================================================================
+    function handleCommand(text) {
+        const cmd = text.trim().toLowerCase();
+        if (cmd === '/chat on') { isChatActive = true; sendTelegramMessage("✅ Đã BẬT chat."); }
+        else if (cmd === '/chat off') { isChatActive = false; sendTelegramMessage("⛔ Đã TẮT chat."); }
+        else if (cmd === '/quota') { sendTelegramMessage(getQuotaInfo()); }
+        else if (cmd === '/debug') { runDebug(); }
+        else if (cmd === '/list') { sendTelegramMessage(COMMANDS_HELP); }
+        else { sendTelegramMessage("❓ Lệnh không hợp lệ. /list để xem."); }
+    }
+
+    // ================================================================
+    // [POLLING]
+    // ================================================================
+    function startPolling() {
+        if (pollIsRunning) return;
+        pollIsRunning = true;
+        console.log("🔄 Bridge V13.6 polling.");
+        poll();
+    }
+
+    async function poll() {
+        if (isWaitingForAgent) { setTimeout(poll, 500); return; }
+        try {
+            const res = await fetch(`https://api.telegram.org/bot${CONFIG.token}/getUpdates?offset=${lastUpdateId + 1}&timeout=30`);
+            const data = await res.json();
+            if (data.ok && data.result.length > 0) {
+                for (const update of data.result) {
+                    lastUpdateId = update.update_id;
+                    if (!update.message || update.message.chat.id != CONFIG.chatId) continue;
+                    if (update.update_id <= lastHandledUpdateId) continue;
+                    const text = update.message.text;
+                    if (!text) continue;
+                    lastHandledUpdateId = update.update_id;
+                    if (text.trim().startsWith('/')) { handleCommand(text); setTimeout(poll, 100); return; }
+                    if (!isChatActive) { sendTelegramMessage("⛔ Chat tắt. Dùng /chat on."); setTimeout(poll, 100); return; }
+                    handleTask(text); setTimeout(poll, 100); return;
+                }
+            }
+        } catch (e) { console.error('Poll error:', e.message); }
+        setTimeout(poll, 100);
+    }
+
+    // ================================================================
+    // [HANDLE TASK]
+    // ================================================================
+    let stopCurrentStream = null;
+
+    function handleTask(text) {
+        const { root } = getAgentScope();
+        if (!root) { sendTelegramMessage("❌ Không tìm thấy panel."); return; }
+
+        const input = root.querySelector('[contenteditable="true"][data-lexical-editor="true"]')
+            || root.querySelector('[contenteditable="true"]')
+            || root.querySelector('textarea, input[type="text"]');
+        if (!input) { sendTelegramMessage("❌ Không tìm thấy ô nhập liệu."); return; }
+
+        isWaitingForAgent = true;
+        sendTelegramMessage("⏳ Đang gửi cho Agent...");
+        streamState = { messageIds: [], lastFullText: "", lastSendTime: 0, pendingSend: false };
+
+        input.focus();
+        try {
+            if (input.tagName.toLowerCase() === 'textarea' || input.tagName.toLowerCase() === 'input') {
+                const proto = input.tagName.toLowerCase() === 'textarea'
+                    ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+                const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+                if (setter) setter.call(input, text);
+                else input.value = text;
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+            } else {
+                // contenteditable div
+                input.textContent = text;
+                input.dispatchEvent(new InputEvent('input', { bubbles: true, data: text }));
+            }
+        } catch (e) { input.textContent = text; }
+
+        setTimeout(() => {
+            // ⭐ Dùng findSendButton thay vì aria-label
+            const sendBtn = findSendButton(root);
+            if (sendBtn && !sendBtn.disabled) {
+                sendBtn.click();
+                console.log("✅ Clicked Send");
+            } else {
+                input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
+                console.log("✅ Pressed Enter");
+            }
+
+            // Lấy baseline sau 700ms
+            setTimeout(() => {
+                const baselineText = getAgentMessageText(root);
+                const baselinePCount = root.querySelectorAll('p').length;
+                console.log(`📌 Baseline pCount=${baselinePCount}, text="${baselineText.substring(0, 60)}"`);
+                startContentObserver(root, baselineText, baselinePCount);
+            }, 700);
+        }, 300);
+    }
+
+    // ================================================================
+    // [OBSERVER]
+    // ================================================================
+    function startContentObserver(root, baselineText, baselinePCount) {
+        if (stopCurrentStream) stopCurrentStream();
+        streamRound++;
+        let finished = false, foundNewContent = false, checkInterval = null, observer = null;
+
+        const cleanup = () => {
+            if (finished) return; finished = true;
+            clearInterval(checkInterval);
+            if (observer) try { observer.disconnect(); } catch (e) { }
+            stopCurrentStream = null;
+        };
+        stopCurrentStream = cleanup;
+
+        const onContentChange = () => {
+            const currentPCount = root.querySelectorAll('p').length;
+            const text = getAgentMessageText(root);
+            if (!text) return;
+
+            // Phát hiện nội dung mới: nhiều p hơn baseline HOẶC text thay đổi
+            if (!foundNewContent && (currentPCount > baselinePCount || text !== baselineText)) {
+                foundNewContent = true;
+                console.log(`✅ Nội dung mới! pCount: ${currentPCount} / baseline: ${baselinePCount}`);
+            }
+            if (!foundNewContent || text === streamState.lastFullText) return;
+
+            streamState.lastFullText = text;
+            streamState.pendingSend = true;
+            const now = Date.now();
+            if (now - streamState.lastSendTime >= THROTTLE_MS) {
+                streamState.lastSendTime = now;
+                streamState.pendingSend = false;
+                updateTelegram(text);
+            }
+        };
+
+        try {
+            observer = new MutationObserver(() => onContentChange());
+            observer.observe(root, { childList: true, subtree: true, characterData: true });
+        } catch (e) { }
+
+        checkInterval = setInterval(async () => {
+            if (finished) return;
+            onContentChange();
+            if (foundNewContent && streamState.pendingSend && Date.now() - streamState.lastSendTime >= THROTTLE_MS) {
+                streamState.lastSendTime = Date.now();
+                streamState.pendingSend = false;
+                await updateTelegram(streamState.lastFullText);
+            }
+            if (!isAgentBusy(root) && isWaitingForAgent) {
+                isWaitingForAgent = false;
+                console.log("✅ Agent done.");
+            }
+            clickRunButtons(root);
+        }, 500);
+    }
+
+    function clickRunButtons(root) {
+        for (const btn of root.querySelectorAll('button')) {
+            if (btn.hasAttribute('data-auto-clicked')) continue;
+            const txt = (btn.innerText || '').trim().toLowerCase();
+            if (txt.startsWith('run') && !btn.disabled) {
+                btn.click();
+                btn.setAttribute('data-auto-clicked', 'true');
+            }
+        }
+    }
+
+    console.log("🚀 BRIDGE V13.6 (TAILWIND FIX) READY.");
+    startPolling();
 })();
